@@ -12,17 +12,32 @@ require("dotenv").config();
 
 const app = express();
 app.use(express.json());
+
+// Session configuration should come before CORS
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'your-secret-key',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: true,
+        sameSite: 'none',
+        maxAge: 24 * 60 * 60 * 1000,
+        domain: '.vercel.app' // Allow cookies for your Vercel domain
+    }
+}));
+
+// Updated CORS configuration
 app.use(cors({
-    origin: "http://localhost:3000",
-    credentials: true
+    origin: ["http://localhost:3000", "https://hokagee.vercel.app", "https://dream-git-main-srijas-projects.vercel.app"],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Set-Cookie', 'Origin', 'Accept']
 }));
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => console.log("MongoDB Connected"))
-.catch(err => console.log("MongoDB Connection Error:", err));
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log("MongoDB Connected"))
+    .catch(err => console.log("MongoDB Connection Error:", err));
 
 // Password Reset Token Schema
 const resetTokenSchema = new mongoose.Schema({
@@ -97,21 +112,28 @@ app.post("/login", async (req, res) => {
     }
 });
 // // Google OAuth
-app.use(session({ secret: "secret", resave: false, saveUninitialized: true }));
 app.use(passport.initialize());
 app.use(passport.session());
 
 passport.use(new passportGoogle({
     clientID: process.env.GOOGLE_CLIENT_ID,
     clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackURL: "/auth/google/callback"
+    callbackURL: process.env.CALLBACK_URL || "https://hokage-backend.onrender.com/auth/google/callback"
 }, async (accessToken, refreshToken, profile, done) => {
-    let user = await User.findOne({ googleId: profile.id });
-    if (!user) {
-        user = new User({ name: profile.displayName, email: profile.emails[0].value, googleId: profile.id });
-        await user.save();
+    try {
+        let user = await User.findOne({ googleId: profile.id });
+        if (!user) {
+            user = new User({ 
+                name: profile.displayName, 
+                email: profile.emails[0].value, 
+                googleId: profile.id 
+            });
+            await user.save();
+        }
+        return done(null, user);
+    } catch (error) {
+        return done(error, null);
     }
-    return done(null, user);
 }));
 
 passport.serializeUser((user, done) => done(null, user.id));
@@ -123,10 +145,15 @@ passport.deserializeUser(async (id, done) => {
 app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
 
 app.get("/auth/google/callback", passport.authenticate("google", { failureRedirect: "/" }), (req, res) => {
-    // Generate JWT token for Google authenticated user
-    const token = jwt.sign({ userId: req.user._id }, process.env.JWT_SECRET, { expiresIn: "1h" });
-    // Redirect to frontend with token
-    res.redirect(`http://localhost:3000/auth/google/callback?token=${token}`);
+    try {
+        // Generate JWT token for Google authenticated user
+        const token = jwt.sign({ userId: req.user._id }, process.env.JWT_SECRET, { expiresIn: "1h" });
+        // Redirect to frontend with token
+        res.redirect(`${process.env.FRONTEND_URL || 'https://hokagee.vercel.app'}/auth/google/callback?token=${token}`);
+    } catch (error) {
+        console.error("Error in Google callback:", error);
+        res.redirect(`${process.env.FRONTEND_URL || 'https://hokagee.vercel.app'}/login?error=auth_failed`);
+    }
 });
 
 /////auth token
@@ -153,48 +180,111 @@ const authenticateToken = (req, res, next) => {
 const fetchAndStoreAnime = async () => {
     try {
         console.log("Fetching YouTube data...");
+        
+        // Check for YouTube API key
+        if (!process.env.YOUTUBE_API_KEY) {
+            console.error("YouTube API key is missing! Please set the YOUTUBE_API_KEY environment variable.");
+            throw new Error("YouTube API key is not configured!");
+        }
+        console.log("YouTube API Key exists:", process.env.YOUTUBE_API_KEY ? "Yes" : "No");
+
         let nextPageToken = "";
         let videos = [];
         const BASE_URL = "https://www.googleapis.com/youtube/v3/search";
+        const channelId = "UCP8E_gJhRMApuQYOQ21MkLA";
+
+        console.log(`Attempting to fetch videos from channel: ${channelId}`);
 
         while (videos.length < 500) {
-            const response = await axios.get(BASE_URL, {
-                params: {
+            console.log(`Making YouTube API request (current videos: ${videos.length})`);
+            try {
+                const params = {
                     key: process.env.YOUTUBE_API_KEY,
-                    channelId: "UCP8E_gJhRMApuQYOQ21MkLA",
+                    channelId: channelId,
                     part: "snippet",
                     type: "video",
                     maxResults: 50,
                     pageToken: nextPageToken
+                };
+                console.log("Request params:", { ...params, key: "HIDDEN" });
+
+                const response = await axios.get(BASE_URL, { params });
+                console.log("YouTube API Response Status:", response.status);
+                console.log("Response data:", {
+                    pageInfo: response.data?.pageInfo,
+                    itemCount: response.data?.items?.length,
+                    nextPageToken: response.data?.nextPageToken
+                });
+
+                if (!response.data.items || response.data.items.length === 0) {
+                    console.log("No items returned from YouTube API");
+                    break;
                 }
-            });
 
-            if (!response.data.items || response.data.items.length === 0) break;
-
-            videos.push(
-                ...response.data.items.map(video => ({
+                const newVideos = response.data.items.map(video => ({
                     title: video.snippet.title,
                     description: video.snippet.description,
                     youtubeEmbedUrl: `https://www.youtube.com/embed/${video.id.videoId}`
-                }))
-            );
+                }));
 
-            console.log(`Fetched ${videos.length} videos so far...`);
-            nextPageToken = response.data.nextPageToken;
-            if (!nextPageToken) break;
+                videos.push(...newVideos);
+                console.log(`Fetched ${videos.length} videos so far...`);
+
+                nextPageToken = response.data.nextPageToken;
+                if (!nextPageToken) {
+                    console.log("No next page token, finishing fetch");
+                    break;
+                }
+            } catch (apiError) {
+                console.error("YouTube API request failed:");
+                console.error("Error message:", apiError.message);
+                if (apiError.response) {
+                    console.error("Error response data:", apiError.response.data);
+                    console.error("Error response status:", apiError.response.status);
+                }
+                break;
+            }
         }
 
+        if (videos.length === 0) {
+            throw new Error("No videos were fetched from YouTube API");
+        }
+
+        console.log("Deleting existing anime from database...");
         await Anime.deleteMany();
+        
+        console.log("Inserting new videos into database...");
         await Anime.insertMany(videos);
 
         console.log(`YouTube data stored successfully! Total videos: ${videos.length}`);
     } catch (err) {
-        console.error("Error fetching YouTube data:", err);
+        console.error("Error in fetchAndStoreAnime:");
+        console.error("Error message:", err.message);
+        if (err.response) {
+            console.error("Error response data:", err.response.data);
+            console.error("Error response status:", err.response.status);
+        }
+        throw err;
     }
 };
 
-setInterval(fetchAndStoreAnime, 24 * 60 * 60 * 1000);
-fetchAndStoreAnime();
+// Initial fetch with error handling
+(async () => {
+    try {
+        await fetchAndStoreAnime();
+    } catch (error) {
+        console.error("Initial fetchAndStoreAnime failed:", error.message);
+    }
+})();
+
+// Schedule periodic updates
+setInterval(async () => {
+    try {
+        await fetchAndStoreAnime();
+    } catch (error) {
+        console.error("Scheduled fetchAndStoreAnime failed:", error.message);
+    }
+}, 24 * 60 * 60 * 1000);
 
 // Get all anime
 app.get("/anime", async (req, res) => {
@@ -320,7 +410,9 @@ app.get("/logout", (req, res) => {
     });
 });
 
-app.listen(5001, () => console.log("Server running on port 5001"));
+// Update port configuration for Render deployment
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 /////////////////////////////////////////////
 
